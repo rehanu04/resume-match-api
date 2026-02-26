@@ -183,7 +183,7 @@ def match(req: MatchRequest):
             f"Highlight/add these (if you have them): {', '.join(missing[:10])}."
         )
     suggestions.append(
-        "Quantify impact: reduced latency by X%, improved accuracy by Y%."
+        "Quantify impact in your bullets (examples: 'reduced API latency by 20%', 'improved accuracy from 82% to 90%', 'cut build time by 30%')."
     )
     suggestions.append("Add GitHub + deployed links for projects.")
 
