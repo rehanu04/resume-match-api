@@ -195,26 +195,3 @@ def match(req: MatchRequest):
         "resume_skills": sorted(list(resume_skills)),
         "suggestions": suggestions,
     }
-
-
-@app.get("/resume/{resume_id}/preview")
-def resume_preview(resume_id: str):
-    if resume_id not in RESUMES:
-        raise HTTPException(status_code=404, detail="resume_id not found")
-    text = RESUMES[resume_id]["text"]
-    # show first 1200 chars for debugging
-    return {"resume_id": resume_id, "preview": text[:1200]}
-
-
-@app.get("/resume/{resume_id}/preview_norm")
-def resume_preview_norm(resume_id: str):
-    if resume_id not in RESUMES:
-        raise HTTPException(status_code=404, detail="resume_id not found")
-    raw = RESUMES[resume_id]["text"]
-    norm = normalize(raw)
-    return {
-        "resume_id": resume_id,
-        "has_sql": ("sql" in norm),
-        "has_streamlit": ("streamlit" in norm),
-        "preview_norm": norm[:1200],
-    }
