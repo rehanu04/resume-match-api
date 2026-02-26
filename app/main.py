@@ -1,7 +1,7 @@
 import hashlib
 import io
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -10,28 +10,201 @@ from pypdf import PdfReader
 app = FastAPI(title="Resume Match API", version="0.1.0")
 
 
+# -------------------------
+# Models
+# -------------------------
 class MatchRequest(BaseModel):
     resume_id: str
     job_description: str
-
-
-# --- ATS Readiness (v1) ---
 
 
 class AtsRequest(BaseModel):
     resume_id: str
 
 
-# --- ATS Readiness (v2 fixes) ---
+# -------------------------
+# Normalization + PDF text
+# -------------------------
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    chunks = []
+    for page in reader.pages:
+        chunks.append(page.extract_text() or "")
+    return "\n".join(chunks).strip()
+
+
+def normalize(text: str) -> str:
+    t = (text or "").lower()
+
+    # Remove zero-width / BOM
+    t = t.replace("\u200b", "").replace("\ufeff", "")
+
+    # Normalize NBSP
+    t = t.replace("\u00a0", " ")
+
+    # Replace bullet-like separators
+    t = re.sub(r"[•·●▪■◆▶►]", " ", t)
+
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Collapse spaced letters into words: "s q l" -> "sql"
+    t = re.sub(
+        r"(?<!\w)(?:[a-z]\s+){1,}[a-z](?!\w)",
+        lambda m: m.group(0).replace(" ", ""),
+        t,
+    )
+
+    # Normalize punctuation spacing
+    t = t.replace(" . ", ".").replace(" / ", "/").replace(" - ", "-")
+
+    # Split glued words after known skills (helps pdf extraction issues)
+    for skill in [
+        "sql",
+        "streamlit",
+        "python",
+        "docker",
+        "github",
+        "git",
+        "mongodb",
+        "nodejs",
+        "node.js",
+        "fastapi",
+    ]:
+        t = re.sub(rf"({re.escape(skill)})([a-z])", r"\1 \2", t)
+
+    return t
+
+
+def compact_text(s: str) -> str:
+    # Remove whitespace and dots to handle spaced-out emails/urls
+    return re.sub(r"[\s\.]", "", (s or "").lower())
+
+
+def compact_ws(s: str) -> str:
+    # remove whitespace only (keep dots) for better email detection
+    return re.sub(r"\s+", "", (s or "").lower())
+
+
+# -------------------------
+# Skills (curated + extras)
+# -------------------------
+# Curated canonical skills and aliases (stable scoring + matching)
+SKILL_ALIASES: Dict[str, List[str]] = {
+    "c": ["c"],
+    "c++": ["c++", "cpp", "c plus plus"],
+    "html": ["html"],
+    "css": ["css"],
+    "streamlit": ["streamlit"],
+    "sql": ["sql", "sqlite"],
+    "postgresql": ["postgresql", "postgre sql", "postgres", "postgre"],
+    "mysql": ["mysql"],
+    "mongodb": ["mongodb", "mongo"],
+    "redis": ["redis"],
+    "bash": ["bash", "shell scripting"],
+    "powershell": ["powershell", "power shell"],
+    "python": ["python"],
+    "javascript": ["javascript", "js"],
+    "typescript": ["typescript", "ts"],
+    "java": ["java"],
+    "kotlin": ["kotlin"],
+    "docker": ["docker"],
+    "kubernetes": ["kubernetes", "k8s"],
+    "git": ["git"],
+    "github": ["github"],
+    "linux": ["linux"],
+    "fastapi": ["fastapi", "fast api"],
+    "flask": ["flask"],
+    "django": ["django"],
+    "spring": ["spring", "spring boot"],
+    "node": ["node", "nodejs", "node.js"],
+    "express": ["express", "expressjs"],
+    "react": ["react", "reactjs"],
+    "next.js": ["next.js", "nextjs", "next js"],
+    "android": ["android"],
+    "android studio": ["android studio"],
+    "machine learning": ["machine learning", "ml"],
+    "deep learning": ["deep learning", "dl"],
+    "pytorch": ["pytorch", "torch"],
+    "tensorflow": ["tensorflow", "tf"],
+    "nlp": ["nlp", "natural language processing"],
+    "aws": ["aws", "amazon web services"],
+    "gcp": ["gcp", "google cloud", "google cloud platform"],
+    "azure": ["azure", "microsoft azure"],
+}
+
+# Generic “extra skill” extraction (captures unknown tech)
+# You can expand this allowlist anytime without breaking API.
+GENERIC_TECH_RE = re.compile(
+    r"\b("
+    r"go|golang|rust|scala|swift|php|ruby|perl|r|matlab|"
+    r"graphql|grpc|rest|restapi|microservices|"
+    r"firebase|supabase|vercel|netlify|render|railway|"
+    r"docker|kubernetes|helm|terraform|ansible|"
+    r"nginx|apache|"
+    r"redis|kafka|rabbitmq|"
+    r"postgresql|mysql|sqlite|mongodb|dynamodb|"
+    r"pandas|numpy|scikit[- ]learn|opencv|"
+    r"langchain|llamaindex|rag|llm|"
+    r"openai|gemini|vertex|huggingface|"
+    r"linux|git|github|gitlab|bitbucket"
+    r")\b",
+    re.I,
+)
+
+STOP_EXTRA = set(["rest", "restapi"])  # too generic; remove if you want them listed
+
+
+def extract_skills(text: str) -> List[str]:
+    t = normalize(text)
+    found: Set[str] = set()
+
+    for canonical, aliases in SKILL_ALIASES.items():
+        for a in aliases:
+            pattern = r"(?<!\w)" + re.escape(a) + r"(?!\w)"
+            if re.search(pattern, t):
+                found.add(canonical)
+                break
+
+    return sorted(found)
+
+
+def extract_extra_skills(text: str, curated: List[str]) -> List[str]:
+    t = normalize(text)
+    hits = {
+        m.group(0).lower().replace(" ", "").replace("-", "")
+        for m in GENERIC_TECH_RE.finditer(t)
+    }
+    # normalize some known tokens
+    normalized = set()
+    for h in hits:
+        if h in STOP_EXTRA:
+            continue
+        if h == "golang":
+            normalized.add("go")
+        elif h == "scikitlearn":
+            normalized.add("scikit-learn")
+        else:
+            normalized.add(h)
+
+    # remove anything already covered by curated list
+    curated_norm = {c.lower().replace(" ", "").replace("-", "") for c in curated}
+    extras = sorted([x for x in normalized if x not in curated_norm])
+    return extras[:30]  # keep response sane
+
+
+# -------------------------
+# ATS Readiness (credible)
+# -------------------------
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-# Keep phone detection, but we will exclude it from "metrics"
 PHONE_RE = re.compile(r"(\+?\d[\d\s\-()]{8,}\d)")
 URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s]+", re.I)
-
 LINK_HINT_RE = re.compile(r"(linkedin\.com|github\.com)", re.I)
 
-# Words that signal "achievement metric" context
 IMPACT_WORD_RE = re.compile(
     r"\b(reduced|improved|increased|decreased|optimized|boosted|cut|saved|grew|raised|lowered)\b",
     re.I,
@@ -45,23 +218,22 @@ DOMAIN_METRIC_RE = re.compile(
     re.I,
 )
 
-# Strong metrics (these we count even without nearby impact words)
 PERCENT_RE = re.compile(r"\b\d{1,3}(\.\d+)?\s*%\b")
 ARROW_RE = re.compile(r"\b\d{1,3}(\.\d+)?\s*%?\s*(->|→)\s*\d{1,3}(\.\d+)?\s*%?\b")
 
-# Dates/years/phones we should NOT count as achievement metrics
 YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
 DATEISH_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 
+SECTION_HINTS = {
+    "education": ["education", "academic", "university", "college"],
+    "skills": ["skills", "technical skills", "tech stack", "tooling"],
+    "experience": ["experience", "work experience", "employment", "internship"],
+    "projects": ["projects", "project", "personal projects"],
+}
 
-def compact_text(s: str) -> str:
-    # remove whitespace and dots to handle "r e h a n u 0 4 @ g m a i l . c o m"
-    return re.sub(r"[\s\.]", "", s.lower())
 
-
-def extract_urls(raw: str) -> list[str]:
+def extract_urls(raw: str) -> List[str]:
     urls = URL_RE.findall(raw or "")
-    # normalize "www." to "https://www."
     out = []
     for u in urls:
         if u.lower().startswith("www."):
@@ -71,26 +243,38 @@ def extract_urls(raw: str) -> list[str]:
     return out
 
 
-def count_achievement_metrics(raw: str, text_norm: str) -> int:
+def has_section(text_norm: str, keys: List[str]) -> bool:
+    return any(k in text_norm for k in keys)
+
+
+def count_achievement_metrics(raw: str) -> int:
     """
     Count only achievement-like metrics.
-    - Count % and arrow patterns
-    - Count numbers near impact words or domain metric words
-    - Exclude phone numbers, years, and date-like patterns
+    Exclude phone numbers, years, and date-like patterns.
+    Count:
+    - % metrics
+    - arrow metrics (82%→90%)
+    - numbers on lines containing impact or domain metric words
+    - time/unit lines (2 hours, 300ms)
     """
     raw = raw or ""
-    # Remove phone/date/year to reduce false counts
+
     scrubbed = PHONE_RE.sub(" ", raw)
     scrubbed = DATEISH_RE.sub(" ", scrubbed)
     scrubbed = YEAR_RE.sub(" ", scrubbed)
 
-    # 1) Strong metrics
     strong = len(PERCENT_RE.findall(scrubbed)) + len(ARROW_RE.findall(scrubbed))
 
-    # 2) Contextual metrics: number near impact words or domain metric words
-    # Look for patterns like "reduced latency by 20", "improved accuracy to 90%", "saved 2 hours"
     contextual = 0
-    lines = scrubbed.splitlines() if "\n" in scrubbed else scrubbed.split("•")
+    # split on bullets/newlines (works for most resumes)
+    lines = []
+    if "\n" in scrubbed:
+        lines = scrubbed.splitlines()
+    elif "•" in scrubbed:
+        lines = scrubbed.split("•")
+    else:
+        lines = scrubbed.split(".")
+
     for line in lines:
         ln = line.strip()
         if not ln:
@@ -98,12 +282,9 @@ def count_achievement_metrics(raw: str, text_norm: str) -> int:
         ln_norm = normalize(ln)
         if not (IMPACT_WORD_RE.search(ln_norm) or DOMAIN_METRIC_RE.search(ln_norm)):
             continue
-        # number token (1-4 digits) OR decimal, optionally with unit
         if re.search(r"\b\d+(\.\d+)?\b", ln):
-            # avoid counting if the only digits are very long ids left over (rare)
             contextual += 1
 
-    # 3) Time/unit metrics without % but with units
     unit_hits = 0
     for line in lines:
         ln = line.strip()
@@ -112,39 +293,27 @@ def count_achievement_metrics(raw: str, text_norm: str) -> int:
         if METRIC_UNIT_RE.search(ln) and re.search(r"\b\d+(\.\d+)?\b", ln):
             unit_hits += 1
 
-    return strong + contextual + unit_hits
+    # dedupe-ish: contextual and unit_hits can overlap; keep it simple but not huge
+    return strong + contextual + max(0, unit_hits - 1)
 
 
-def has_section(text_norm: str, keys: list[str]) -> bool:
-    return any(k in text_norm for k in keys)
-
-
-def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
-    """
-    ATS Readiness Score (0-100): parseability + completeness + impact signals.
-    Heuristic, not an official ATS score.
-    """
+def ats_readiness_score(raw_text: str, extracted_skills: List[str]) -> dict:
     raw_text = raw_text or ""
     text_norm = normalize(raw_text)
     text_compact = compact_text(raw_text)
 
-    warnings = []
-    tips = []
+    warnings: List[str] = []
+    tips: List[str] = []
 
-    # --- Contact signals (15 pts) ---
+    # Contact signals
+    text_ws = compact_ws(raw_text)
+
     email_ok = (
         bool(EMAIL_RE.search(raw_text))
-        or ("@" in text_compact and "gmailcom" in text_compact)
-        or ("@gmail" in text_compact)
-        or ("@outlook" in text_compact)
+        or bool(EMAIL_RE.search(text_ws))
+        or bool(re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", text_ws))
+        or bool(re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", text_compact))
     )
-    # more robust email check in compact text
-    if not email_ok:
-        # try compact email regex
-        email_ok = bool(
-            re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", text_compact)
-        )
-
     phone_ok = bool(PHONE_RE.search(raw_text))
 
     urls = extract_urls(raw_text)
@@ -173,7 +342,7 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
         warnings.append("LinkedIn/GitHub link not detected.")
         tips.append("Add LinkedIn + GitHub links in the header.")
 
-    # --- Section signals (25 pts) ---
+    # Sections
     edu_ok = has_section(text_norm, SECTION_HINTS["education"])
     skills_ok = has_section(text_norm, SECTION_HINTS["skills"])
     exp_ok = has_section(text_norm, SECTION_HINTS["experience"])
@@ -201,7 +370,7 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
         warnings.append("Experience/Projects not clearly detected.")
         tips.append("Add a 'Projects' section with 2–3 projects and bullet points.")
 
-    # --- Bullet/format signals (10 pts) ---
+    # Bullets
     bullet_count = sum(raw_text.count(ch) for ch in ["•", "·", "●"]) + raw_text.count(
         "- "
     )
@@ -210,7 +379,7 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
         warnings.append("Very few bullet points detected (ATS readability risk).")
         tips.append("Use bullet points for achievements under projects/experience.")
 
-    # --- Keyword density (25 pts) ---
+    # Keyword density
     skill_count = len(set(extracted_skills))
     skill_pts = min(25, skill_count * 3)
     if skill_count < 6:
@@ -219,30 +388,34 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
             "Add relevant tools/frameworks you actually used (FastAPI, SQL, Git, Docker...)."
         )
 
-    # --- Impact & metrics (25 pts) ---
-    metrics_count = count_achievement_metrics(raw_text, text_norm)
+    # Metrics / impact (stricter)
+    metrics_count = count_achievement_metrics(raw_text)
 
     if metrics_count >= 4:
         impact_pts = 25
     elif metrics_count >= 2:
-        impact_pts = 18
+        impact_pts = 15
     elif metrics_count >= 1:
-        impact_pts = 12
+        impact_pts = 10
     else:
-        impact_pts = 5
+        impact_pts = 4
         warnings.append("No measurable achievement metrics detected.")
         tips.append(
             "Add numbers: 'reduced latency by 20%', 'improved accuracy 82%→90%', etc."
         )
 
-    # Small bump if impact verbs appear in the resume text overall
     impact_hits = len(IMPACT_WORD_RE.findall(text_norm))
     if impact_hits >= 3:
-        impact_pts = min(25, impact_pts + 4)
+        impact_pts = min(25, impact_pts + 3)
 
-    # --- Final score ---
     total = contact_pts + section_pts + bullet_pts + skill_pts + impact_pts
     total = max(0, min(100, int(round(total))))
+
+    # Credibility caps (prevents inflated “perfect” ATS scores)
+    if metrics_count < 1:
+        total = min(total, 75)
+    elif metrics_count < 3:
+        total = min(total, 85)
 
     label = (
         "Excellent"
@@ -272,125 +445,15 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
     }
 
 
-# v1 skill list (expand later)
-SKILL_ALIASES = {
-    "c": ["c"],
-    "c++": ["c++", "cpp", "c plus plus"],
-    "html": ["html"],
-    "css": ["css"],
-    "streamlit": ["streamlit"],
-    "sql": ["sql", "sqlite", "postgresql", "mysql"],
-    "bash": ["bash", "shell scripting"],
-    "powershell": ["powershell", "power shell"],
-    "python": ["python"],
-    "javascript": ["javascript", "js"],
-    "typescript": ["typescript", "ts"],
-    "java": ["java"],
-    "kotlin": ["kotlin"],
-    "postgresql": ["postgresql", "postgre sql", "postgres", "postgre"],
-    "mysql": ["mysql"],
-    "mongodb": ["mongodb", "mongo"],
-    "redis": ["redis"],
-    "docker": ["docker"],
-    "kubernetes": ["kubernetes", "k8s"],
-    "git": ["git", "github", "gitlab", "bitbucket"],
-    "github": ["github"],
-    "linux": ["linux"],
-    "fastapi": ["fastapi", "fast api"],
-    "flask": ["flask"],
-    "django": ["django"],
-    "spring": ["spring", "spring boot"],
-    "node": ["node", "nodejs", "node.js"],
-    "express": ["express", "expressjs"],
-    "react": ["react", "reactjs"],
-    "next.js": ["next.js", "nextjs", "next js"],
-    "android": ["android"],
-    "android studio": ["android studio"],
-    "machine learning": ["machine learning", "ml"],
-    "deep learning": ["deep learning", "dl"],
-    "pytorch": ["pytorch", "torch"],
-    "tensorflow": ["tensorflow", "tf"],
-    "nlp": ["nlp", "natural language processing"],
-    "aws": ["aws", "amazon web services"],
-    "gcp": ["gcp", "google cloud", "google cloud platform"],
-    "azure": ["azure", "microsoft azure"],
-}
-
-# In-memory store for MVP (Supabase in v2)
+# -------------------------
+# In-memory store
+# -------------------------
 RESUMES: Dict[str, Dict[str, Any]] = {}
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    chunks = []
-    for page in reader.pages:
-        chunks.append(page.extract_text() or "")
-    return "\n".join(chunks).strip()
-
-
-def normalize(text: str) -> str:
-    t = text.lower()
-
-    # Remove zero-width / BOM that can break matching
-    t = t.replace("\u200b", "").replace("\ufeff", "")
-
-    # Normalize NBSP to normal space
-    t = t.replace("\u00a0", " ")
-
-    # Replace common bullet-like separators with spaces
-    t = re.sub(r"[•·●▪■◆▶►]", " ", t)
-
-    # Collapse whitespace
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # Collapse spaced letters into words: "s q l" -> "sql", "s t r e a m l i t" -> "streamlit"
-    t = re.sub(
-        r"(?<!\w)(?:[a-z]\s+){1,}[a-z](?!\w)",
-        lambda m: m.group(0).replace(" ", ""),
-        t,
-    )
-
-    # Normalize punctuation spacing
-    t = t.replace(" . ", ".").replace(" / ", "/").replace(" - ", "-")
-
-    # Insert a space if a known skill word is immediately followed by letters
-    # e.g., "sqlframeworks" -> "sql frameworks", "streamlitconcepts" -> "streamlit concepts"
-    for skill in [
-        "sql",
-        "streamlit",
-        "python",
-        "docker",
-        "github",
-        "git",
-        "mongodb",
-        "nodejs",
-        "node.js",
-    ]:
-        t = re.sub(rf"({re.escape(skill)})([a-z])", r"\1 \2", t)
-
-    return t
-
-
-def extract_skills(text: str) -> List[str]:
-    t = normalize(text)
-    found = set()
-
-    for canonical, aliases in SKILL_ALIASES.items():
-        for a in aliases:
-            # word boundary match where possible
-            # handles punctuation like "Python," "Docker/" etc.
-            pattern = r"(?<!\w)" + re.escape(a) + r"(?!\w)"
-            if re.search(pattern, t):
-                found.add(canonical)
-                break
-
-    return sorted(found)
-
-
+# -------------------------
+# Routes
+# -------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -410,10 +473,22 @@ async def upload_resume(file: UploadFile = File(...)):
 
     resume_hash = sha256_text(text)
     resume_id = resume_hash[:16]
-    skills = extract_skills(text)
 
-    RESUMES[resume_id] = {"resume_hash": resume_hash, "text": text, "skills": skills}
-    return {"resume_id": resume_id, "skills": skills, "text_chars": len(text)}
+    curated_skills = extract_skills(text)
+    extra_skills = extract_extra_skills(text, curated_skills)
+
+    RESUMES[resume_id] = {
+        "resume_hash": resume_hash,
+        "text": text,
+        "skills": curated_skills,
+        "extra_skills": extra_skills,
+    }
+    return {
+        "resume_id": resume_id,
+        "skills": curated_skills,
+        "extra_skills": extra_skills,
+        "text_chars": len(text),
+    }
 
 
 @app.post("/match")
@@ -440,7 +515,8 @@ def match(req: MatchRequest):
             f"Highlight/add these (if you have them): {', '.join(missing[:10])}."
         )
     suggestions.append(
-        "Quantify impact in your bullets (examples: 'reduced API latency by 20%', 'improved accuracy from 82% to 90%', 'cut build time by 30%')."
+        "Quantify impact in your bullets (examples: 'reduced API latency by 20%', "
+        "'improved accuracy from 82% to 90%', 'cut build time by 30%')."
     )
     suggestions.append("Add GitHub + deployed links for projects.")
 
