@@ -17,23 +17,102 @@ class MatchRequest(BaseModel):
 
 # --- ATS Readiness (v1) ---
 
+
 class AtsRequest(BaseModel):
     resume_id: str
 
 
+# --- ATS Readiness (v2 fixes) ---
+
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+# Keep phone detection, but we will exclude it from "metrics"
 PHONE_RE = re.compile(r"(\+?\d[\d\s\-()]{8,}\d)")
-URL_RE = re.compile(r"\bhttps?://[^\s]+", re.I)
+URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s]+", re.I)
 
-SECTION_HINTS = {
-    "education": ["education", "academic", "university", "college"],
-    "skills": ["skills", "technical skills", "tech stack", "tooling"],
-    "experience": ["experience", "work experience", "employment", "internship"],
-    "projects": ["projects", "project", "personal projects"],
-}
+LINK_HINT_RE = re.compile(r"(linkedin\.com|github\.com)", re.I)
 
-IMPACT_WORDS = ["reduced", "improved", "increased", "optimized", "built", "deployed", "shipped"]
-METRIC_RE = re.compile(r"(\b\d{1,4}\b|\b\d+(\.\d+)?%|\b\d+(\.\d+)?(k|m)\b)", re.I)
+# Words that signal "achievement metric" context
+IMPACT_WORD_RE = re.compile(
+    r"\b(reduced|improved|increased|decreased|optimized|boosted|cut|saved|grew|raised|lowered)\b",
+    re.I,
+)
+METRIC_UNIT_RE = re.compile(
+    r"\b(ms|millisecond|s|sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months)\b",
+    re.I,
+)
+DOMAIN_METRIC_RE = re.compile(
+    r"\b(latency|accuracy|throughput|response time|runtime|memory|cpu|fps|users|requests|qps|tps|errors|cost)\b",
+    re.I,
+)
+
+# Strong metrics (these we count even without nearby impact words)
+PERCENT_RE = re.compile(r"\b\d{1,3}(\.\d+)?\s*%\b")
+ARROW_RE = re.compile(r"\b\d{1,3}(\.\d+)?\s*%?\s*(->|→)\s*\d{1,3}(\.\d+)?\s*%?\b")
+
+# Dates/years/phones we should NOT count as achievement metrics
+YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+DATEISH_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+
+
+def compact_text(s: str) -> str:
+    # remove whitespace and dots to handle "r e h a n u 0 4 @ g m a i l . c o m"
+    return re.sub(r"[\s\.]", "", s.lower())
+
+
+def extract_urls(raw: str) -> list[str]:
+    urls = URL_RE.findall(raw or "")
+    # normalize "www." to "https://www."
+    out = []
+    for u in urls:
+        if u.lower().startswith("www."):
+            out.append("https://" + u)
+        else:
+            out.append(u)
+    return out
+
+
+def count_achievement_metrics(raw: str, text_norm: str) -> int:
+    """
+    Count only achievement-like metrics.
+    - Count % and arrow patterns
+    - Count numbers near impact words or domain metric words
+    - Exclude phone numbers, years, and date-like patterns
+    """
+    raw = raw or ""
+    # Remove phone/date/year to reduce false counts
+    scrubbed = PHONE_RE.sub(" ", raw)
+    scrubbed = DATEISH_RE.sub(" ", scrubbed)
+    scrubbed = YEAR_RE.sub(" ", scrubbed)
+
+    # 1) Strong metrics
+    strong = len(PERCENT_RE.findall(scrubbed)) + len(ARROW_RE.findall(scrubbed))
+
+    # 2) Contextual metrics: number near impact words or domain metric words
+    # Look for patterns like "reduced latency by 20", "improved accuracy to 90%", "saved 2 hours"
+    contextual = 0
+    lines = scrubbed.splitlines() if "\n" in scrubbed else scrubbed.split("•")
+    for line in lines:
+        ln = line.strip()
+        if not ln:
+            continue
+        ln_norm = normalize(ln)
+        if not (IMPACT_WORD_RE.search(ln_norm) or DOMAIN_METRIC_RE.search(ln_norm)):
+            continue
+        # number token (1-4 digits) OR decimal, optionally with unit
+        if re.search(r"\b\d+(\.\d+)?\b", ln):
+            # avoid counting if the only digits are very long ids left over (rare)
+            contextual += 1
+
+    # 3) Time/unit metrics without % but with units
+    unit_hits = 0
+    for line in lines:
+        ln = line.strip()
+        if not ln:
+            continue
+        if METRIC_UNIT_RE.search(ln) and re.search(r"\b\d+(\.\d+)?\b", ln):
+            unit_hits += 1
+
+    return strong + contextual + unit_hits
 
 
 def has_section(text_norm: str, keys: list[str]) -> bool:
@@ -45,29 +124,51 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
     ATS Readiness Score (0-100): parseability + completeness + impact signals.
     Heuristic, not an official ATS score.
     """
-    text_norm = normalize(raw_text)  # you already have normalize()
+    raw_text = raw_text or ""
+    text_norm = normalize(raw_text)
+    text_compact = compact_text(raw_text)
 
     warnings = []
     tips = []
 
     # --- Contact signals (15 pts) ---
-    email_ok = bool(EMAIL_RE.search(raw_text))
+    email_ok = (
+        bool(EMAIL_RE.search(raw_text))
+        or ("@" in text_compact and "gmailcom" in text_compact)
+        or ("@gmail" in text_compact)
+        or ("@outlook" in text_compact)
+    )
+    # more robust email check in compact text
+    if not email_ok:
+        # try compact email regex
+        email_ok = bool(
+            re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", text_compact)
+        )
+
     phone_ok = bool(PHONE_RE.search(raw_text))
-    links = URL_RE.findall(raw_text)
-    link_ok = any(("linkedin" in u.lower() or "github" in u.lower()) for u in links)
+
+    urls = extract_urls(raw_text)
+    link_ok = (
+        any(LINK_HINT_RE.search(u) for u in urls)
+        or ("linkedincom" in text_compact)
+        or ("githubcom" in text_compact)
+    )
 
     contact_pts = 0
-    if email_ok: contact_pts += 5
+    if email_ok:
+        contact_pts += 5
     else:
         warnings.append("Email not clearly detected.")
         tips.append("Add a visible email in the header (e.g., name@gmail.com).")
 
-    if phone_ok: contact_pts += 5
+    if phone_ok:
+        contact_pts += 5
     else:
         warnings.append("Phone number not clearly detected.")
         tips.append("Add a phone number in international format (+91 / +1...).")
 
-    if link_ok: contact_pts += 5
+    if link_ok:
+        contact_pts += 5
     else:
         warnings.append("LinkedIn/GitHub link not detected.")
         tips.append("Add LinkedIn + GitHub links in the header.")
@@ -79,56 +180,64 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
     proj_ok = has_section(text_norm, SECTION_HINTS["projects"])
 
     section_pts = 0
-    if edu_ok: section_pts += 6
+    if edu_ok:
+        section_pts += 6
     else:
         warnings.append("Education section not clearly detected.")
         tips.append("Add a section heading: 'Education' with degree + college + year.")
 
-    if skills_ok: section_pts += 6
+    if skills_ok:
+        section_pts += 6
     else:
         warnings.append("Skills section not clearly detected.")
         tips.append("Add a section heading: 'Skills' with tech keywords in one place.")
 
-    # Experience/Projects are weighted heavier
-    if exp_ok: section_pts += 7
-    if proj_ok: section_pts += 6
+    if exp_ok:
+        section_pts += 7
+    if proj_ok:
+        section_pts += 6
 
     if not (exp_ok or proj_ok):
         warnings.append("Experience/Projects not clearly detected.")
         tips.append("Add a 'Projects' section with 2–3 projects and bullet points.")
 
     # --- Bullet/format signals (10 pts) ---
-    bullet_count = sum(raw_text.count(ch) for ch in ["•", "·", "●"]) + raw_text.count("- ")
+    bullet_count = sum(raw_text.count(ch) for ch in ["•", "·", "●"]) + raw_text.count(
+        "- "
+    )
     bullet_pts = 10 if bullet_count >= 6 else (6 if bullet_count >= 2 else 2)
     if bullet_count < 2:
         warnings.append("Very few bullet points detected (ATS readability risk).")
         tips.append("Use bullet points for achievements under projects/experience.")
 
     # --- Keyword density (25 pts) ---
-    # extracted_skills already comes from your SKILL_ALIASES
-    skill_pts = min(25, len(set(extracted_skills)) * 3)  # 0..25
-    if len(set(extracted_skills)) < 6:
+    skill_count = len(set(extracted_skills))
+    skill_pts = min(25, skill_count * 3)
+    if skill_count < 6:
         warnings.append("Low visible keyword density.")
-        tips.append("Add relevant tools/frameworks you actually used (FastAPI, SQL, Git, Docker...).")
+        tips.append(
+            "Add relevant tools/frameworks you actually used (FastAPI, SQL, Git, Docker...)."
+        )
 
     # --- Impact & metrics (25 pts) ---
-    metrics_found = METRIC_RE.findall(raw_text)
-    impact_word_hits = sum(1 for w in IMPACT_WORDS if w in text_norm)
+    metrics_count = count_achievement_metrics(raw_text, text_norm)
 
-    impact_pts = 0
-    if len(metrics_found) >= 4:
+    if metrics_count >= 4:
         impact_pts = 25
-    elif len(metrics_found) >= 2:
+    elif metrics_count >= 2:
         impact_pts = 18
-    elif len(metrics_found) >= 1:
+    elif metrics_count >= 1:
         impact_pts = 12
     else:
         impact_pts = 5
-        warnings.append("No measurable metrics detected.")
-        tips.append("Add numbers: 'reduced latency by 20%', 'improved accuracy 82%→90%', etc.")
+        warnings.append("No measurable achievement metrics detected.")
+        tips.append(
+            "Add numbers: 'reduced latency by 20%', 'improved accuracy 82%→90%', etc."
+        )
 
-    # If impact verbs exist, give a small bump (without exceeding 25)
-    if impact_word_hits >= 3:
+    # Small bump if impact verbs appear in the resume text overall
+    impact_hits = len(IMPACT_WORD_RE.findall(text_norm))
+    if impact_hits >= 3:
         impact_pts = min(25, impact_pts + 4)
 
     # --- Final score ---
@@ -136,10 +245,9 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
     total = max(0, min(100, int(round(total))))
 
     label = (
-        "Excellent" if total >= 85 else
-        "Strong" if total >= 70 else
-        "Good" if total >= 55 else
-        "Needs improvement"
+        "Excellent"
+        if total >= 85
+        else "Strong" if total >= 70 else "Good" if total >= 55 else "Needs improvement"
     )
 
     return {
@@ -158,9 +266,9 @@ def ats_readiness_score(raw_text: str, extracted_skills: list[str]) -> dict:
                 "projects": proj_ok,
             },
             "bullet_count": bullet_count,
-            "skill_count": len(set(extracted_skills)),
-            "metrics_count": len(metrics_found),
-        }
+            "skill_count": skill_count,
+            "metrics_count": metrics_count,
+        },
     }
 
 
@@ -349,7 +457,9 @@ def match(req: MatchRequest):
 @app.post("/ats")
 def ats(req: AtsRequest):
     if req.resume_id not in RESUMES:
-        raise HTTPException(status_code=404, detail="resume_id not found. Upload resume first.")
+        raise HTTPException(
+            status_code=404, detail="resume_id not found. Upload resume first."
+        )
 
     raw_text = RESUMES[req.resume_id]["text"]
     skills = RESUMES[req.resume_id].get("skills", [])
