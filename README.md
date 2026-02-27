@@ -10,7 +10,10 @@ It supports:
 ## Live Demo (Deployed)
 - Swagger UI: https://resume-match-api-gace.onrender.com/docs  
 - Health: https://resume-match-api-gace.onrender.com/health
+  
+Android app repo: https://github.com/rehanu04/resumematch-android
 
+Android Release download: https://github.com/rehanu04/resumematch-android/releases
 ## Endpoints
 ### 1) Upload Resume (PDF)
 `POST /resume/upload`  
@@ -30,3 +33,4 @@ It estimates how ATS-friendly the resume is based on structure, contact detectio
 **Input:**  
 ```json
 { "resume_id": "<id>", "job_description": "..." }
+
